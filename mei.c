@@ -921,6 +921,45 @@ mei_add_sysctls(struct mei_softc *sc)
 /*
  * Device interface.
  */
+/* Start the interface and attach the client drivers. */
+static void
+mei_start(void *arg)
+{
+	struct mei_softc *sc = arg;
+	device_t child;
+	int error, i;
+
+	sx_xlock(&sc->hbm_lock);
+	mtx_lock(&sc->mtx);
+	error = mei_hw_start(sc);
+	if (error == 0)
+		error = mei_hbm_start(sc);
+	if (error == 0)
+		error = mei_hbm_enum(sc);
+	if (error == 0)
+		sc->ready = 1;
+	mtx_unlock(&sc->mtx);
+	sx_xunlock(&sc->hbm_lock);
+	if (error != 0) {
+		/* Stay attached, so that the registers can show why. */
+		device_printf(sc->dev, "start failed: %d\n", error);
+		return;
+	}
+	device_printf(sc->dev, "%d ME clients, %s\n", sc->nclients,
+	    sc->msi ? "MSI" : "INTx");
+
+	bus_topo_lock();
+	for (i = 0; i < sc->nclients; i++) {
+		child = device_add_child(sc->dev, NULL, DEVICE_UNIT_ANY);
+		if (child == NULL)
+			continue;
+		sc->clients[i].child = child;
+		device_set_ivars(child, &sc->clients[i]);
+	}
+	bus_attach_children(sc->dev);
+	bus_topo_unlock();
+}
+
 static int
 mei_probe(device_t dev)
 {
@@ -936,7 +975,6 @@ mei_attach(device_t dev)
 	struct mei_softc *sc = device_get_softc(dev);
 	static const int hfs_reg[6] = { MEI_PCI_HFS_1, MEI_PCI_HFS_2,
 	    MEI_PCI_HFS_3, MEI_PCI_HFS_4, MEI_PCI_HFS_5, MEI_PCI_HFS_6 };
-	device_t child;
 	int count, error, i;
 
 	sc->dev = dev;
@@ -983,33 +1021,14 @@ mei_attach(device_t dev)
 
 	mei_add_sysctls(sc);
 
-	sx_xlock(&sc->hbm_lock);
-	mtx_lock(&sc->mtx);
-	error = mei_hw_start(sc);
-	if (error == 0)
-		error = mei_hbm_start(sc);
-	if (error == 0)
-		error = mei_hbm_enum(sc);
-	if (error == 0)
-		sc->ready = 1;
-	mtx_unlock(&sc->mtx);
-	sx_xunlock(&sc->hbm_lock);
-	if (error != 0) {
-		/* Stay attached, so that the registers can show why. */
-		device_printf(dev, "start failed: %d\n", error);
-		return (0);
-	}
-	device_printf(dev, "%d ME clients, %s\n", sc->nclients,
-	    sc->msi ? "MSI" : "INTx");
-
-	for (i = 0; i < sc->nclients; i++) {
-		child = device_add_child(dev, NULL, DEVICE_UNIT_ANY);
-		if (child == NULL)
-			continue;
-		sc->clients[i].child = child;
-		device_set_ivars(child, &sc->clients[i]);
-	}
-	bus_attach_children(dev);
+	/*
+	 * The start sleeps with a timeout.  During boot, timed sleeps are
+	 * not possible yet, so start from a config hook.
+	 */
+	if (cold)
+		config_intrhook_oneshot(mei_start, sc);
+	else
+		mei_start(sc);
 	return (0);
 
 fail:
