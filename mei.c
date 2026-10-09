@@ -12,7 +12,12 @@
  * address 0 are Host Bus Messages (HBM).  The host uses HBM to start
  * the interface, to list the ME clients and to connect to them.
  *
- * This first version starts the interface and lists the ME clients.
+ * Flow control: a side can send one message to a client only after it
+ * gets a flow control credit for that client from the other side.
+ *
+ * The driver adds a child device for each ME client.  Client drivers
+ * use the functions in mei.h to exchange messages with their client.
+ *
  * It attaches only to the "iTouch" MEI device of Ice Lake (8086:34e4),
  * which Intel Precise Touch & Stylus (IPTS) uses on the Surface Pro 7.
  */
@@ -28,6 +33,7 @@
 #include <sys/mutex.h>
 #include <sys/rman.h>
 #include <sys/sbuf.h>
+#include <sys/sx.h>
 #include <sys/sysctl.h>
 
 #include <machine/bus.h>
@@ -35,6 +41,8 @@
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
+
+#include "mei.h"
 
 /* MMIO registers. */
 #define	MEI_H_CB_WW	0x00	/* host circular buffer write window */
@@ -85,25 +93,44 @@
 #define	HBM_START_REQ		0x01
 #define	HBM_ENUM_REQ		0x04
 #define	HBM_PROPS_REQ		0x05
+#define	HBM_CONNECT_REQ		0x06
+#define	HBM_DISCONNECT_REQ	0x07
+#define	HBM_FLOW_CONTROL	0x08
 #define	HBM_RES			0x80
 #define	HBM_START_RES_LEN	4
 #define	HBM_ENUM_RES_LEN	36
 #define	HBM_PROPS_RES_LEN	28
+#define	HBM_CONNECT_RES_LEN	4
+#define	HBM_FLOW_CONTROL_LEN	8
 
 #define	HBM_VERSION_MAJOR	2
 #define	HBM_VERSION_MINOR	0
 
 #define	MEI_READY_TIMEOUT	(2 * hz)
 #define	MEI_HBM_TIMEOUT		(5 * hz)
+#define	MEI_POLL		MAX(1, hz / 100)
+
+/* Number of received messages that a client can keep. */
+#define	MEI_RXQ_LEN		8
+
+struct mei_rx_msg {
+	size_t		len;
+	uint8_t		data[MEI_MAX_MSG + 1];
+};
 
 struct mei_client {
-	uint8_t		addr;
-	uint8_t		uuid[16];
-	uint8_t		version;
-	uint8_t		max_conn;
-	uint8_t		fixed;
-	uint8_t		single_recv;
-	uint32_t	max_msg;
+	struct mei_client_props	props;
+	uint8_t			host_addr;
+	device_t		child;
+	int			connected;
+	int			tx_credits;	/* we can send */
+	int			rx_credit;	/* the ME can send */
+	struct mei_rx_msg	rxq[MEI_RXQ_LEN];
+	u_int			rxq_head;
+	u_int			rxq_count;
+	u_long			st_rx;
+	u_long			st_rx_drop;
+	u_long			st_tx;
 };
 
 struct mei_softc {
@@ -116,7 +143,9 @@ struct mei_softc {
 	int			msi;
 
 	struct mtx		mtx;
+	struct sx		hbm_lock;	/* one HBM request at a time */
 	int			d0i3_supported;
+	int			ready;
 	uint8_t			hbm_major;
 	uint8_t			hbm_minor;
 
@@ -135,7 +164,7 @@ struct mei_softc {
 	u_long			st_intr;
 	u_long			st_rx_msgs;
 	u_long			st_rx_hbm_other;
-	u_long			st_rx_client;
+	u_long			st_rx_client_unknown;
 	u_long			st_rx_errors;
 	u_long			st_me_resets;
 };
@@ -160,22 +189,120 @@ mei_wait_reg(struct mei_softc *sc, bus_size_t reg, uint32_t mask,
 {
 	int t;
 
-	for (t = 0; t < timo; t += MAX(1, hz / 100)) {
+	for (t = 0; t < timo; t += MEI_POLL) {
 		if ((RD4(sc, reg) & mask) == val)
 			return (0);
-		msleep(sc, &sc->mtx, 0, "meireg", MAX(1, hz / 100));
+		msleep(sc, &sc->mtx, 0, "meireg", MEI_POLL);
 	}
 	return ((RD4(sc, reg) & mask) == val ? 0 : ETIMEDOUT);
 }
 
 /*
+ * Send.
+ */
+static int
+mei_write(struct mei_softc *sc, uint8_t me_addr, uint8_t host_addr,
+    const void *data, size_t len)
+{
+	const uint8_t *p = data;
+	uint32_t hcsr, dw;
+	u_int depth, filled, n;
+	size_t chunk, i;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+	if (len > MEI_MAX_MSG)
+		return (EINVAL);
+	if ((RD4(sc, MEI_ME_CSR) & CSR_RDY) == 0)
+		return (EIO);
+
+	hcsr = RD4(sc, MEI_H_CSR);
+	depth = CSR_CBD(hcsr);
+	filled = (uint8_t)(CSR_CBWP(hcsr) - CSR_CBRP(hcsr));
+	if (filled > depth)
+		return (EIO);
+	n = 1 + howmany(len, 4);
+	if (n > depth - filled)
+		return (EAGAIN);
+
+	WR4(sc, MEI_H_CB_WW, MEI_HDR(me_addr, host_addr, len));
+	for (i = 0; i < len; i += 4) {
+		chunk = MIN(4, len - i);
+		dw = 0;
+		memcpy(&dw, p + i, chunk);
+		WR4(sc, MEI_H_CB_WW, le32toh(dw));
+	}
+	mei_hcsr_set(sc, RD4(sc, MEI_H_CSR) | CSR_IG);
+	return (0);
+}
+
+/* Give the ME a credit to send one message to the client.  Lock held. */
+static void
+mei_send_flow_control(struct mei_softc *sc, struct mei_client *cl)
+{
+	uint8_t msg[HBM_FLOW_CONTROL_LEN];
+
+	if (!cl->connected || cl->props.fixed || cl->rx_credit ||
+	    cl->rxq_count >= MEI_RXQ_LEN)
+		return;
+	memset(msg, 0, sizeof(msg));
+	msg[0] = HBM_FLOW_CONTROL;
+	msg[1] = cl->props.addr;
+	msg[2] = cl->host_addr;
+	if (mei_write(sc, 0, 0, msg, sizeof(msg)) == 0)
+		cl->rx_credit = 1;
+}
+
+/*
  * Receive.
  */
+static struct mei_client *
+mei_find_client(struct mei_softc *sc, uint8_t me_addr)
+{
+	int i;
+
+	for (i = 0; i < sc->nclients; i++)
+		if (sc->clients[i].props.addr == me_addr)
+			return (&sc->clients[i]);
+	return (NULL);
+}
+
 static void
 mei_rx_hbm(struct mei_softc *sc, const uint8_t *msg, size_t len)
 {
-	if (len >= 1 && sc->hbm_wait != 0 && msg[0] == sc->hbm_wait &&
-	    !sc->hbm_done) {
+	struct mei_client *cl;
+	uint8_t rsp[4];
+
+	if (len < 1)
+		return;
+
+	switch (msg[0]) {
+	case HBM_FLOW_CONTROL:
+		/* The credit can come before we see the connect response. */
+		if (len >= 3 && (cl = mei_find_client(sc, msg[1])) != NULL) {
+			cl->tx_credits++;
+			wakeup(&cl->tx_credits);
+		}
+		return;
+	case HBM_DISCONNECT_REQ:
+		/* The ME closes the connection. */
+		if (len >= 3 && (cl = mei_find_client(sc, msg[1])) != NULL) {
+			device_printf(sc->dev, "client %u: ME disconnects\n",
+			    cl->props.addr);
+			cl->connected = 0;
+			cl->tx_credits = 0;
+			cl->rx_credit = 0;
+			wakeup(&cl->tx_credits);
+			wakeup(&cl->rxq_count);
+			rsp[0] = HBM_DISCONNECT_REQ | HBM_RES;
+			rsp[1] = msg[1];
+			rsp[2] = msg[2];
+			rsp[3] = 0;
+			(void)mei_write(sc, 0, 0, rsp, sizeof(rsp));
+		}
+		return;
+	}
+
+	if (sc->hbm_wait != 0 && msg[0] == sc->hbm_wait && !sc->hbm_done) {
 		memcpy(sc->hbm_rsp, msg, len);
 		sc->hbm_rsp_len = len;
 		sc->hbm_done = 1;
@@ -183,9 +310,37 @@ mei_rx_hbm(struct mei_softc *sc, const uint8_t *msg, size_t len)
 		return;
 	}
 	sc->st_rx_hbm_other++;
-	if (bootverbose && len >= 1)
+	if (bootverbose)
 		device_printf(sc->dev, "HBM message %#x, %zu bytes\n",
 		    msg[0], len);
+}
+
+static void
+mei_rx_client(struct mei_softc *sc, uint32_t hdr, const uint8_t *msg,
+    size_t len)
+{
+	struct mei_client *cl;
+	struct mei_rx_msg *m;
+
+	cl = mei_find_client(sc, MEI_HDR_ME(hdr));
+	if (cl == NULL || !cl->connected ||
+	    MEI_HDR_HOST(hdr) != cl->host_addr) {
+		sc->st_rx_client_unknown++;
+		return;
+	}
+	cl->rx_credit = 0;
+	if (cl->rxq_count >= MEI_RXQ_LEN || !MEI_HDR_COMPLETE(hdr)) {
+		/* The message is too long or does not fit. */
+		cl->st_rx_drop++;
+	} else {
+		m = &cl->rxq[(cl->rxq_head + cl->rxq_count) % MEI_RXQ_LEN];
+		memcpy(m->data, msg, len);
+		m->len = len;
+		cl->rxq_count++;
+		cl->st_rx++;
+		wakeup(&cl->rxq_count);
+	}
+	mei_send_flow_control(sc, cl);
 }
 
 /* Read all messages from the ME circular buffer.  Lock held. */
@@ -237,7 +392,7 @@ mei_process(struct mei_softc *sc)
 		if (MEI_HDR_ME(hdr) == 0 && MEI_HDR_HOST(hdr) == 0)
 			mei_rx_hbm(sc, (uint8_t *)sc->rbuf, len);
 		else
-			sc->st_rx_client++;
+			mei_rx_client(sc, hdr, (uint8_t *)sc->rbuf, len);
 
 		/* Tell the ME that we read the slots. */
 		mei_hcsr_set(sc, RD4(sc, MEI_H_CSR) | CSR_IG);
@@ -253,44 +408,6 @@ mei_intr(void *arg)
 	sc->st_intr++;
 	mei_process(sc);
 	mtx_unlock(&sc->mtx);
-}
-
-/*
- * Send.
- */
-static int
-mei_write(struct mei_softc *sc, uint8_t me_addr, uint8_t host_addr,
-    const void *data, size_t len)
-{
-	const uint8_t *p = data;
-	uint32_t hcsr, dw;
-	u_int depth, filled, n, i;
-	size_t chunk;
-
-	mtx_assert(&sc->mtx, MA_OWNED);
-	if (len > MEI_MAX_MSG)
-		return (EINVAL);
-	if ((RD4(sc, MEI_ME_CSR) & CSR_RDY) == 0)
-		return (EIO);
-
-	hcsr = RD4(sc, MEI_H_CSR);
-	depth = CSR_CBD(hcsr);
-	filled = (uint8_t)(CSR_CBWP(hcsr) - CSR_CBRP(hcsr));
-	if (filled > depth)
-		return (EIO);
-	n = 1 + howmany(len, 4);
-	if (n > depth - filled)
-		return (EAGAIN);
-
-	WR4(sc, MEI_H_CB_WW, MEI_HDR(me_addr, host_addr, len));
-	for (i = 0; i < len; i += 4) {
-		chunk = MIN(4, len - i);
-		dw = 0;
-		memcpy(&dw, p + i, chunk);
-		WR4(sc, MEI_H_CB_WW, le32toh(dw));
-	}
-	mei_hcsr_set(sc, RD4(sc, MEI_H_CSR) | CSR_IG);
-	return (0);
 }
 
 /*
@@ -312,18 +429,17 @@ mei_hbm_request(struct mei_softc *sc, const void *req, size_t len,
 		error = mei_write(sc, 0, 0, req, len);
 		if (error != EAGAIN)
 			break;
-		msleep(sc, &sc->mtx, 0, "meiwr", MAX(1, hz / 100));
+		msleep(sc, &sc->mtx, 0, "meiwr", MEI_POLL);
 	}
 	if (error != 0)
 		goto out;
 
 	/* Poll as well, in case the interrupt does not come. */
-	for (t = 0; t < MEI_HBM_TIMEOUT && !sc->hbm_done;
-	    t += MAX(1, hz / 100)) {
+	for (t = 0; t < MEI_HBM_TIMEOUT && !sc->hbm_done; t += MEI_POLL) {
 		mei_process(sc);
 		if (sc->hbm_done)
 			break;
-		msleep(&sc->hbm_done, &sc->mtx, 0, "meihbm", MAX(1, hz / 100));
+		msleep(&sc->hbm_done, &sc->mtx, 0, "meihbm", MEI_POLL);
 	}
 	if (!sc->hbm_done)
 		error = ETIMEDOUT;
@@ -372,8 +488,9 @@ mei_hw_start(struct mei_softc *sc)
 	if ((error = mei_d0i3_exit(sc)) != 0)
 		return (error);
 
-	device_printf(sc->dev, "before reset: H_CSR %#x ME_CSR %#x\n",
-	    RD4(sc, MEI_H_CSR), RD4(sc, MEI_ME_CSR));
+	if (bootverbose)
+		device_printf(sc->dev, "before reset: H_CSR %#x ME_CSR %#x\n",
+		    RD4(sc, MEI_H_CSR), RD4(sc, MEI_ME_CSR));
 
 	/* A reset that did not complete can leave H_RST set. */
 	hcsr = RD4(sc, MEI_H_CSR);
@@ -407,8 +524,9 @@ mei_hw_start(struct mei_softc *sc)
 	hcsr |= H_CSR_IE_MASK | CSR_IG | CSR_RDY;
 	mei_hcsr_set(sc, hcsr);
 
-	device_printf(sc->dev, "after reset: H_CSR %#x ME_CSR %#x\n",
-	    RD4(sc, MEI_H_CSR), RD4(sc, MEI_ME_CSR));
+	if (bootverbose)
+		device_printf(sc->dev, "after reset: H_CSR %#x ME_CSR %#x\n",
+		    RD4(sc, MEI_H_CSR), RD4(sc, MEI_ME_CSR));
 	return (0);
 }
 
@@ -429,16 +547,17 @@ mei_hbm_start(struct mei_softc *sc)
 		    HBM_START_RES_LEN);
 		if (error != 0)
 			return (error);
-		device_printf(sc->dev, "HBM: ME version %u.%u, host version "
-		    "%u.%u %s\n", sc->hbm_rsp[3], sc->hbm_rsp[2],
-		    sc->hbm_major, sc->hbm_minor,
-		    sc->hbm_rsp[1] ? "supported" : "not supported");
-		if (sc->hbm_rsp[1])
+		if (sc->hbm_rsp[1]) {
+			device_printf(sc->dev, "HBM version %u.%u (ME %u.%u)\n",
+			    sc->hbm_major, sc->hbm_minor, sc->hbm_rsp[3],
+			    sc->hbm_rsp[2]);
 			return (0);
+		}
 		/* Try again with the version of the ME. */
 		sc->hbm_major = sc->hbm_rsp[3];
 		sc->hbm_minor = sc->hbm_rsp[2];
 	}
+	device_printf(sc->dev, "no common HBM version\n");
 	return (ENXIO);
 }
 
@@ -449,6 +568,15 @@ mei_uuid_str(const uint8_t *u, char *buf, size_t len)
 	    "%02x%02x%02x%02x%02x%02x", le32dec(&u[0]), le16dec(&u[4]),
 	    le16dec(&u[6]), u[8], u[9], u[10], u[11], u[12], u[13], u[14],
 	    u[15]);
+}
+
+int
+mei_uuid_match(const uint8_t *uuid, const char *str)
+{
+	char buf[40];
+
+	mei_uuid_str(uuid, buf, sizeof(buf));
+	return (strcmp(buf, str) == 0);
 }
 
 static const struct {
@@ -513,21 +641,202 @@ mei_hbm_enum(struct mei_softc *sc)
 			    addr, sc->hbm_rsp[2]);
 			continue;
 		}
-		cl = &sc->clients[sc->nclients++];
-		cl->addr = addr;
-		memcpy(cl->uuid, &sc->hbm_rsp[4], 16);
-		cl->version = sc->hbm_rsp[20];
-		cl->max_conn = sc->hbm_rsp[21];
-		cl->fixed = sc->hbm_rsp[22];
-		cl->single_recv = sc->hbm_rsp[23] & 1;
-		cl->max_msg = le32dec(&sc->hbm_rsp[24]);
+		cl = &sc->clients[sc->nclients];
+		cl->host_addr = ++sc->nclients;
+		cl->props.addr = addr;
+		memcpy(cl->props.uuid, &sc->hbm_rsp[4], 16);
+		cl->props.version = sc->hbm_rsp[20];
+		cl->props.max_conn = sc->hbm_rsp[21];
+		cl->props.fixed = sc->hbm_rsp[22];
+		cl->props.single_recv = sc->hbm_rsp[23] & 1;
+		cl->props.max_msg = le32dec(&sc->hbm_rsp[24]);
+		/*
+		 * The ME does not accept a connection to a client with a
+		 * fixed address.  The host sends to it from host address 0,
+		 * and neither side uses flow control.
+		 */
+		if (cl->props.fixed)
+			cl->host_addr = 0;
 
-		mei_uuid_str(cl->uuid, uuid, sizeof(uuid));
+		mei_uuid_str(cl->props.uuid, uuid, sizeof(uuid));
 		device_printf(sc->dev, "client %3d: %s v%u conn %u fixed %u "
-		    "max_msg %u %s\n", cl->addr, uuid, cl->version,
-		    cl->max_conn, cl->fixed, cl->max_msg,
+		    "max_msg %u %s\n", addr, uuid, cl->props.version,
+		    cl->props.max_conn, cl->props.fixed, cl->props.max_msg,
 		    mei_client_name(uuid));
 	}
+	return (0);
+}
+
+/*
+ * Client interface.
+ */
+static struct mei_client *
+mei_cl(device_t child, struct mei_softc **scp)
+{
+	*scp = device_get_softc(device_get_parent(child));
+	return (device_get_ivars(child));
+}
+
+const struct mei_client_props *
+mei_cl_props(device_t dev)
+{
+	struct mei_softc *sc;
+
+	return (&mei_cl(dev, &sc)->props);
+}
+
+int
+mei_cl_connect(device_t dev)
+{
+	struct mei_softc *sc;
+	struct mei_client *cl = mei_cl(dev, &sc);
+	uint8_t req[4];
+	int error;
+
+	sx_xlock(&sc->hbm_lock);
+	mtx_lock(&sc->mtx);
+	if (!sc->ready) {
+		error = ENXIO;
+		goto out;
+	}
+	if (cl->connected) {
+		error = EISCONN;
+		goto out;
+	}
+	cl->tx_credits = 0;
+	cl->rx_credit = 0;
+	cl->rxq_head = 0;
+	cl->rxq_count = 0;
+	if (cl->props.fixed) {
+		cl->connected = 1;
+		error = 0;
+		goto out;
+	}
+
+	req[0] = HBM_CONNECT_REQ;
+	req[1] = cl->props.addr;
+	req[2] = cl->host_addr;
+	req[3] = 0;
+	error = mei_hbm_request(sc, req, sizeof(req), HBM_CONNECT_RES_LEN);
+	if (error != 0)
+		goto out;
+	if (sc->hbm_rsp[3] != 0) {
+		device_printf(sc->dev, "client %u: connect status %u\n",
+		    cl->props.addr, sc->hbm_rsp[3]);
+		error = ECONNREFUSED;
+		goto out;
+	}
+	cl->connected = 1;
+	mei_send_flow_control(sc, cl);
+out:
+	mtx_unlock(&sc->mtx);
+	sx_xunlock(&sc->hbm_lock);
+	return (error);
+}
+
+int
+mei_cl_disconnect(device_t dev)
+{
+	struct mei_softc *sc;
+	struct mei_client *cl = mei_cl(dev, &sc);
+	uint8_t req[4];
+	int error;
+
+	sx_xlock(&sc->hbm_lock);
+	mtx_lock(&sc->mtx);
+	error = 0;
+	if (!cl->connected)
+		goto out;
+	if (!cl->props.fixed) {
+		req[0] = HBM_DISCONNECT_REQ;
+		req[1] = cl->props.addr;
+		req[2] = cl->host_addr;
+		req[3] = 0;
+		error = mei_hbm_request(sc, req, sizeof(req),
+		    HBM_CONNECT_RES_LEN);
+	}
+	cl->connected = 0;
+	cl->tx_credits = 0;
+	cl->rx_credit = 0;
+	wakeup(&cl->tx_credits);
+	wakeup(&cl->rxq_count);
+out:
+	mtx_unlock(&sc->mtx);
+	sx_xunlock(&sc->hbm_lock);
+	return (error);
+}
+
+int
+mei_cl_send(device_t dev, const void *buf, size_t len, int timo)
+{
+	struct mei_softc *sc;
+	struct mei_client *cl = mei_cl(dev, &sc);
+	int error, t;
+
+	if (len > MEI_MAX_MSG || len > cl->props.max_msg)
+		return (EMSGSIZE);
+
+	mtx_lock(&sc->mtx);
+	for (t = 0; cl->connected && !cl->props.fixed && cl->tx_credits == 0;
+	    t += MEI_POLL) {
+		if (t >= timo) {
+			mtx_unlock(&sc->mtx);
+			return (ETIMEDOUT);
+		}
+		mei_process(sc);
+		if (cl->tx_credits > 0)
+			break;
+		msleep(&cl->tx_credits, &sc->mtx, 0, "meitx", MEI_POLL);
+	}
+	if (!cl->connected) {
+		mtx_unlock(&sc->mtx);
+		return (ENOTCONN);
+	}
+	for (t = 0; t < 10; t++) {
+		error = mei_write(sc, cl->props.addr, cl->host_addr, buf, len);
+		if (error != EAGAIN)
+			break;
+		msleep(sc, &sc->mtx, 0, "meiwr", MEI_POLL);
+	}
+	if (error == 0) {
+		if (!cl->props.fixed)
+			cl->tx_credits--;
+		cl->st_tx++;
+	}
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+int
+mei_cl_recv(device_t dev, void *buf, size_t maxlen, size_t *len, int timo)
+{
+	struct mei_softc *sc;
+	struct mei_client *cl = mei_cl(dev, &sc);
+	struct mei_rx_msg *m;
+	int t;
+
+	mtx_lock(&sc->mtx);
+	for (t = 0; cl->rxq_count == 0; t += MEI_POLL) {
+		if (!cl->connected) {
+			mtx_unlock(&sc->mtx);
+			return (ENOTCONN);
+		}
+		if (t >= timo) {
+			mtx_unlock(&sc->mtx);
+			return (ETIMEDOUT);
+		}
+		mei_process(sc);
+		if (cl->rxq_count > 0)
+			break;
+		msleep(&cl->rxq_count, &sc->mtx, 0, "meirx", MEI_POLL);
+	}
+	m = &cl->rxq[cl->rxq_head];
+	memcpy(buf, m->data, MIN(maxlen, m->len));
+	*len = m->len;
+	cl->rxq_head = (cl->rxq_head + 1) % MEI_RXQ_LEN;
+	cl->rxq_count--;
+	mei_send_flow_control(sc, cl);
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
@@ -547,10 +856,13 @@ mei_clients_sysctl(SYSCTL_HANDLER_ARGS)
 	mtx_lock(&sc->mtx);
 	for (i = 0; i < sc->nclients; i++) {
 		cl = &sc->clients[i];
-		mei_uuid_str(cl->uuid, uuid, sizeof(uuid));
-		sbuf_printf(&sb, "\n%3u %s v%u conn %u fixed %u max_msg %u %s",
-		    cl->addr, uuid, cl->version, cl->max_conn, cl->fixed,
-		    cl->max_msg, mei_client_name(uuid));
+		mei_uuid_str(cl->props.uuid, uuid, sizeof(uuid));
+		sbuf_printf(&sb, "\n%3u %s v%u conn %u fixed %u max_msg %u "
+		    "%s connected %d tx %lu rx %lu drop %lu",
+		    cl->props.addr, uuid, cl->props.version,
+		    cl->props.max_conn, cl->props.fixed, cl->props.max_msg,
+		    mei_client_name(uuid), cl->connected, cl->st_tx,
+		    cl->st_rx, cl->st_rx_drop);
 	}
 	mtx_unlock(&sc->mtx);
 	error = sbuf_finish(&sb);
@@ -599,7 +911,8 @@ mei_add_sysctls(struct mei_softc *sc)
 	STAT("intr", st_intr, "Interrupts");
 	STAT("rx_msgs", st_rx_msgs, "Messages received");
 	STAT("rx_hbm_other", st_rx_hbm_other, "Unexpected HBM messages");
-	STAT("rx_client", st_rx_client, "Client messages received");
+	STAT("rx_client_unknown", st_rx_client_unknown,
+	    "Messages for clients that are not connected");
 	STAT("rx_errors", st_rx_errors, "Receive errors");
 	STAT("me_resets", st_me_resets, "Resets from the ME");
 #undef STAT
@@ -623,17 +936,20 @@ mei_attach(device_t dev)
 	struct mei_softc *sc = device_get_softc(dev);
 	static const int hfs_reg[6] = { MEI_PCI_HFS_1, MEI_PCI_HFS_2,
 	    MEI_PCI_HFS_3, MEI_PCI_HFS_4, MEI_PCI_HFS_5, MEI_PCI_HFS_6 };
+	device_t child;
 	int count, error, i;
 
 	sc->dev = dev;
 	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
+	sx_init(&sc->hbm_lock, "mei hbm");
 
 	for (i = 0; i < 6; i++)
 		sc->hfs[i] = pci_read_config(dev, hfs_reg[i], 4);
 	sc->d0i3_supported = (sc->hfs[0] & MEI_HFS_1_D0I3) != 0;
-	device_printf(dev, "FW status %08x %08x %08x %08x %08x %08x\n",
-	    sc->hfs[0], sc->hfs[1], sc->hfs[2], sc->hfs[3], sc->hfs[4],
-	    sc->hfs[5]);
+	if (bootverbose)
+		device_printf(dev, "FW status %08x %08x %08x %08x %08x "
+		    "%08x\n", sc->hfs[0], sc->hfs[1], sc->hfs[2], sc->hfs[3],
+		    sc->hfs[4], sc->hfs[5]);
 
 	pci_enable_busmaster(dev);
 
@@ -667,13 +983,17 @@ mei_attach(device_t dev)
 
 	mei_add_sysctls(sc);
 
+	sx_xlock(&sc->hbm_lock);
 	mtx_lock(&sc->mtx);
 	error = mei_hw_start(sc);
 	if (error == 0)
 		error = mei_hbm_start(sc);
 	if (error == 0)
 		error = mei_hbm_enum(sc);
+	if (error == 0)
+		sc->ready = 1;
 	mtx_unlock(&sc->mtx);
+	sx_xunlock(&sc->hbm_lock);
 	if (error != 0) {
 		/* Stay attached, so that the registers can show why. */
 		device_printf(dev, "start failed: %d\n", error);
@@ -681,6 +1001,15 @@ mei_attach(device_t dev)
 	}
 	device_printf(dev, "%d ME clients, %s\n", sc->nclients,
 	    sc->msi ? "MSI" : "INTx");
+
+	for (i = 0; i < sc->nclients; i++) {
+		child = device_add_child(dev, NULL, DEVICE_UNIT_ANY);
+		if (child == NULL)
+			continue;
+		sc->clients[i].child = child;
+		device_set_ivars(child, &sc->clients[i]);
+	}
+	bus_attach_children(dev);
 	return (0);
 
 fail:
@@ -693,10 +1022,16 @@ mei_detach(device_t dev)
 {
 	struct mei_softc *sc = device_get_softc(dev);
 	uint32_t hcsr;
+	int error;
+
+	error = bus_generic_detach(dev);
+	if (error != 0)
+		return (error);
 
 	if (sc->mem != NULL) {
 		/* Stop the interface: disable interrupts, host not ready. */
 		mtx_lock(&sc->mtx);
+		sc->ready = 0;
 		hcsr = RD4(sc, MEI_H_CSR);
 		hcsr &= ~(H_CSR_IE_MASK | CSR_RDY);
 		hcsr |= CSR_RST | CSR_IG;
@@ -718,14 +1053,30 @@ mei_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->mem_rid,
 		    sc->mem);
 	free(sc->clients, M_MEI);
+	sx_destroy(&sc->hbm_lock);
 	mtx_destroy(&sc->mtx);
 	return (0);
+}
+
+static int
+mei_print_child(device_t dev, device_t child)
+{
+	struct mei_client *cl = device_get_ivars(child);
+	int retval;
+
+	retval = bus_print_child_header(dev, child);
+	if (cl != NULL)
+		retval += printf(" at client %u", cl->props.addr);
+	retval += bus_print_child_footer(dev, child);
+	return (retval);
 }
 
 static device_method_t mei_methods[] = {
 	DEVMETHOD(device_probe,		mei_probe),
 	DEVMETHOD(device_attach,	mei_attach),
 	DEVMETHOD(device_detach,	mei_detach),
+
+	DEVMETHOD(bus_print_child,	mei_print_child),
 
 	DEVMETHOD_END
 };
