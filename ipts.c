@@ -40,6 +40,8 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
+#include <sys/sbuf.h>
+#include <sys/sx.h>
 #include <sys/sysctl.h>
 
 #include <machine/bus.h>
@@ -97,6 +99,7 @@
 /* Header at the start of a data buffer. */
 #define	IPTS_DATA_HDR_LEN		64
 #define	IPTS_DATA_TYPE_HID		0x03
+#define	IPTS_DATA_TYPE_GET_FEATURES	0x04
 #define	IPTS_DATA_TYPE_DESCRIPTOR	0x05
 #define	IPTS_DATA_TYPES			8
 /* Type that marks a data buffer as empty (our own value). */
@@ -106,8 +109,22 @@
 #define	IPTS_DESC_MAGIC			8
 #define	IPTS_DESC_SKIP			8
 
-/* Feedback header: the buffer index is at offset 8. */
+/*
+ * Feedback header: command type (0), payload size (4), buffer index
+ * (8), protocol version (12), data type (16), SPI offset (20).  The
+ * payload starts at offset 64.
+ */
 #define	IPTS_FEEDBACK_HDR_LEN		64
+
+/* The HID-to-ME buffer has the index after the last feedback buffer. */
+#define	IPTS_HID2ME_BUFFER		IPTS_BUFFERS
+#define	IPTS_FEEDBACK_SET_FEATURES	0x01
+#define	IPTS_FEEDBACK_GET_FEATURES	0x02
+#define	IPTS_FEEDBACK_OUTPUT_REPORT	0x03
+
+/* Response routing: one slot for each command code. */
+#define	IPTS_RSP_SLOTS			16
+#define	IPTS_RX_POLL			MAX(1, hz / 20)
 
 /* Single-touch report of the firmware: ID, tip, X, Y. */
 #define	IPTS_ST_REPORT_ID		0x40
@@ -188,6 +205,12 @@ struct ipts_dma {
 	int		loaded;
 };
 
+struct ipts_rsp {
+	int		valid;
+	size_t		len;
+	uint8_t		data[IPTS_RSP_MAX];
+};
+
 struct ipts_softc {
 	device_t	dev;
 	int		connected;
@@ -240,6 +263,21 @@ struct ipts_softc {
 	int		dump;
 	u_long		st_ready;
 	uint8_t		ready_rsp[80];
+
+	/* Response routing, protected by mtx. */
+	struct ipts_rsp	rsp[IPTS_RSP_SLOTS];
+	int		rx_reader;
+	u_long		st_rsp_unexpected;
+	struct sx	cmd_lock;	/* one command with response */
+
+	/* Feature reports through the HID-to-ME buffer. */
+	struct sx	feat_lock;
+	int		feat_wait;	/* protected by mtx */
+	int		feat_done;
+	uint8_t		*feat_buf;
+	size_t		feat_len;
+
+	u_long		st_ids[256];	/* input reports by ID */
 };
 
 static void	ipts_hid_input(struct ipts_softc *sc, const uint8_t *rep,
@@ -259,33 +297,74 @@ ipts_cmd_send(struct ipts_softc *sc, uint32_t code, const void *pld,
 	return (mei_cl_send(sc->dev, buf, 4 + plen, IPTS_TIMEOUT));
 }
 
-/* Wait for the response to a command.  Skip other messages. */
+/* Forget an old response before a new command is sent. */
+static void
+ipts_rsp_clear(struct ipts_softc *sc, uint32_t code)
+{
+	mtx_lock(&sc->mtx);
+	sc->rsp[code % IPTS_RSP_SLOTS].valid = 0;
+	mtx_unlock(&sc->mtx);
+}
+
+/*
+ * Wait for the response to a command.  More than one thread can wait
+ * for responses at the same time (the receive thread waits for
+ * READY_FOR_DATA while another thread sends FEEDBACK).  One of the
+ * waiting threads reads from MEI and puts each response into the slot
+ * for its command code.
+ */
 static int
 ipts_cmd_recv(struct ipts_softc *sc, uint32_t code, void *rsp,
     size_t rsp_max, size_t *rsp_len, uint32_t *status, int timo)
 {
-	uint8_t rbuf[IPTS_RSP_MAX + 64];
+	struct ipts_rsp *r = &sc->rsp[code % IPTS_RSP_SLOTS];
+	uint8_t rbuf[IPTS_RSP_MAX];
+	uint32_t c;
 	size_t len;
-	int error, i;
+	int error, t;
 
-	for (i = 0; i < 8; i++) {
-		error = mei_cl_recv(sc->dev, rbuf, sizeof(rbuf), &len, timo);
-		if (error != 0)
+	mtx_lock(&sc->mtx);
+	for (t = 0; !r->valid; t += IPTS_RX_POLL) {
+		if (t >= timo) {
+			mtx_unlock(&sc->mtx);
+			return (ETIMEDOUT);
+		}
+		if (sc->rx_reader) {
+			msleep(&sc->rsp, &sc->mtx, 0, "iptsrsp", IPTS_RX_POLL);
+			continue;
+		}
+		sc->rx_reader = 1;
+		mtx_unlock(&sc->mtx);
+		error = mei_cl_recv(sc->dev, rbuf, sizeof(rbuf), &len,
+		    IPTS_RX_POLL);
+		mtx_lock(&sc->mtx);
+		sc->rx_reader = 0;
+		wakeup(&sc->rsp);
+		if (error == ETIMEDOUT)
+			continue;
+		if (error != 0) {
+			mtx_unlock(&sc->mtx);
 			return (error);
-		if (len >= 8 && le32dec(rbuf) == (code | IPTS_RSP_BIT))
-			break;
-		device_printf(sc->dev, "unexpected message %#x, %zu bytes\n",
-		    len >= 4 ? le32dec(rbuf) : 0, len);
+		}
+		c = len >= 8 ? le32dec(rbuf) : 0;
+		if ((c & IPTS_RSP_BIT) == 0 ||
+		    (c & ~IPTS_RSP_BIT) >= IPTS_RSP_SLOTS) {
+			sc->st_rsp_unexpected++;
+			continue;
+		}
+		c &= ~IPTS_RSP_BIT;
+		sc->rsp[c].len = MIN(len, sizeof(rbuf));
+		memcpy(sc->rsp[c].data, rbuf, sc->rsp[c].len);
+		sc->rsp[c].valid = 1;
 	}
-	if (i == 8)
-		return (EIO);
-
-	*status = le32dec(&rbuf[4]);
-	len = MIN(len, sizeof(rbuf)) - 8;
+	r->valid = 0;
+	*status = le32dec(&r->data[4]);
+	len = r->len - 8;
 	if (rsp != NULL)
-		memcpy(rsp, &rbuf[8], MIN(len, rsp_max));
+		memcpy(rsp, &r->data[8], MIN(len, rsp_max));
 	if (rsp_len != NULL)
 		*rsp_len = len;
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
@@ -297,10 +376,13 @@ ipts_cmd(struct ipts_softc *sc, uint32_t code, const void *pld, size_t plen,
 	uint32_t status;
 	int error;
 
+	sx_xlock(&sc->cmd_lock);
+	ipts_rsp_clear(sc, code);
 	error = ipts_cmd_send(sc, code, pld, plen);
 	if (error == 0)
 		error = ipts_cmd_recv(sc, code, rsp, rsp_max, rsp_len,
 		    &status, IPTS_TIMEOUT);
+	sx_xunlock(&sc->cmd_lock);
 	if (error != 0) {
 		device_printf(sc->dev, "command %#x failed: %d\n", code,
 		    error);
@@ -549,6 +631,35 @@ ipts_feedback(struct ipts_softc *sc, u_int buffer)
 }
 
 /*
+ * Send a report to the device through the HID-to-ME buffer.  The
+ * caller holds feat_lock.
+ */
+static int
+ipts_hid2me(struct ipts_softc *sc, uint32_t type, const void *data,
+    size_t len)
+{
+	struct ipts_dma *d = &sc->hid2me;
+	uint8_t *p = d->vaddr, pld[16];
+
+	sx_assert(&sc->feat_lock, SA_XLOCKED);
+	if (p == NULL || !sc->mem_window_set)
+		return (ENXIO);
+	if (IPTS_FEEDBACK_HDR_LEN + len > sc->feedback_size)
+		return (EMSGSIZE);
+	memset(p, 0, IPTS_FEEDBACK_HDR_LEN + len);
+	le32enc(&p[4], len);
+	le32enc(&p[8], IPTS_HID2ME_BUFFER);
+	le32enc(&p[16], type);
+	memcpy(&p[IPTS_FEEDBACK_HDR_LEN], data, len);
+	bus_dmamap_sync(d->tag, d->map, BUS_DMASYNC_PREWRITE);
+
+	memset(pld, 0, sizeof(pld));
+	pld[0] = IPTS_HID2ME_BUFFER;
+	return (ipts_cmd(sc, IPTS_CMD_FEEDBACK, pld, sizeof(pld), NULL, 0,
+	    NULL));
+}
+
+/*
  * HID transport.
  */
 
@@ -560,6 +671,7 @@ ipts_hid_input(struct ipts_softc *sc, const uint8_t *rep, size_t len)
 	hid_intr_t *intr;
 	void *ctx;
 
+	sc->st_ids[rep[0]]++;
 	if (rep[0] == IPTS_ST_REPORT_ID) {
 		if (len < IPTS_ST_REPORT_LEN)
 			return;
@@ -601,7 +713,8 @@ ipts_hid_intr_setup(device_t dev, device_t child __unused, hid_intr_t intr,
 	struct ipts_softc *sc = device_get_softc(dev);
 
 	rdesc->rdsize = rdesc->isize;
-	rdesc->grsize = rdesc->srsize = rdesc->wrsize = 64;
+	rdesc->grsize = rdesc->srsize = rdesc->wrsize =
+	    sc->feedback_size - IPTS_FEEDBACK_HDR_LEN;
 	mtx_lock(&sc->mtx);
 	sc->intr = intr;
 	sc->intr_ctx = context;
@@ -669,37 +782,96 @@ ipts_hid_read(device_t dev __unused, device_t child __unused,
 }
 
 static int
-ipts_hid_write(device_t dev __unused, device_t child __unused,
-    const void *buf __unused, hid_size_t len __unused)
+ipts_hid_write(device_t dev, device_t child __unused, const void *buf,
+    hid_size_t len)
 {
-	/* Output reports go through the HID-to-ME buffer: not done yet. */
-	return (ENOTSUP);
+	struct ipts_softc *sc = device_get_softc(dev);
+	int error;
+
+	sx_xlock(&sc->feat_lock);
+	error = ipts_hid2me(sc, IPTS_FEEDBACK_OUTPUT_REPORT, buf, len);
+	sx_xunlock(&sc->feat_lock);
+	return (error);
 }
 
 static int
-ipts_hid_get_report(device_t dev __unused, device_t child __unused,
-    void *buf, hid_size_t maxlen, hid_size_t *actlen, uint8_t type,
-    uint8_t id)
+ipts_hid_get_report(device_t dev, device_t child __unused, void *buf,
+    hid_size_t maxlen, hid_size_t *actlen, uint8_t type, uint8_t id)
 {
+	struct ipts_softc *sc = device_get_softc(dev);
 	uint8_t *p = buf;
+	size_t len;
+	int error, t;
 
-	/* Only our own feature report is available. */
-	if (type != HID_FEATURE_REPORT || id != IPTS_MT_MAX_REPORT_ID ||
-	    maxlen < 2)
+	if (type != HID_FEATURE_REPORT || maxlen < 1)
 		return (ENOTSUP);
-	p[0] = IPTS_MT_MAX_REPORT_ID;
-	p[1] = 1;
-	if (actlen != NULL)
-		*actlen = 2;
-	return (0);
+
+	/* Our own feature report. */
+	if (id == IPTS_MT_MAX_REPORT_ID) {
+		if (maxlen < 2)
+			return (EINVAL);
+		p[0] = IPTS_MT_MAX_REPORT_ID;
+		p[1] = 1;
+		if (actlen != NULL)
+			*actlen = 2;
+		return (0);
+	}
+
+	/*
+	 * Ask the device through the HID-to-ME buffer.  The report comes
+	 * back in a data buffer of type GET_FEATURES.
+	 */
+	if (sc->feat_buf == NULL)
+		return (ENXIO);
+	len = MIN(maxlen, sc->feedback_size - IPTS_FEEDBACK_HDR_LEN);
+	sx_xlock(&sc->feat_lock);
+	mtx_lock(&sc->mtx);
+	sc->feat_wait = 1;
+	sc->feat_done = 0;
+	mtx_unlock(&sc->mtx);
+
+	memset(p, 0, len);
+	p[0] = id;
+	error = ipts_hid2me(sc, IPTS_FEEDBACK_GET_FEATURES, p, len);
+
+	mtx_lock(&sc->mtx);
+	for (t = 0; error == 0 && !sc->feat_done; t += hz / 10) {
+		if (t >= IPTS_TIMEOUT) {
+			error = ETIMEDOUT;
+			break;
+		}
+		msleep(&sc->feat_done, &sc->mtx, 0, "iptsft", hz / 10);
+	}
+	if (error == 0) {
+		len = MIN(sc->feat_len, maxlen);
+		memcpy(p, sc->feat_buf, len);
+		if (actlen != NULL)
+			*actlen = len;
+	}
+	sc->feat_wait = 0;
+	mtx_unlock(&sc->mtx);
+	sx_xunlock(&sc->feat_lock);
+	return (error);
 }
 
 static int
-ipts_hid_set_report(device_t dev __unused, device_t child __unused,
-    const void *buf __unused, hid_size_t len __unused,
-    uint8_t type __unused, uint8_t id __unused)
+ipts_hid_set_report(device_t dev, device_t child __unused, const void *buf,
+    hid_size_t len, uint8_t type, uint8_t id __unused)
 {
-	return (ENOTSUP);
+	struct ipts_softc *sc = device_get_softc(dev);
+	uint32_t ftype;
+	int error;
+
+	if (type == HID_FEATURE_REPORT)
+		ftype = IPTS_FEEDBACK_SET_FEATURES;
+	else if (type == HID_OUTPUT_REPORT)
+		ftype = IPTS_FEEDBACK_OUTPUT_REPORT;
+	else
+		return (ENOTSUP);
+	sx_xlock(&sc->feat_lock);
+	error = ipts_hid2me(sc, ftype, buf, len);
+	sx_xunlock(&sc->feat_lock);
+	return (error);
 }
 
 static int
@@ -777,6 +949,18 @@ ipts_handle_buffer(struct ipts_softc *sc, u_int buffer)
 	if (type == IPTS_DATA_TYPE_HID && size > 0 &&
 	    IPTS_DATA_HDR_LEN + size <= sc->data_size)
 		ipts_hid_input(sc, &p[IPTS_DATA_HDR_LEN], size);
+
+	if (type == IPTS_DATA_TYPE_GET_FEATURES &&
+	    IPTS_DATA_HDR_LEN + size <= sc->data_size) {
+		mtx_lock(&sc->mtx);
+		if (sc->feat_wait && !sc->feat_done) {
+			memcpy(sc->feat_buf, &p[IPTS_DATA_HDR_LEN], size);
+			sc->feat_len = size;
+			sc->feat_done = 1;
+			wakeup(&sc->feat_done);
+		}
+		mtx_unlock(&sc->mtx);
+	}
 
 	if (sc->dump > 0) {
 		sc->dump--;
@@ -860,6 +1044,7 @@ ipts_thread(void *arg)
 
 		/* Event mode. */
 		if (!waiting) {
+			ipts_rsp_clear(sc, IPTS_CMD_READY_FOR_DATA);
 			error = ipts_cmd_send(sc, IPTS_CMD_READY_FOR_DATA,
 			    NULL, 0);
 			if (error != 0) {
@@ -902,6 +1087,7 @@ ipts_start(struct ipts_softc *sc)
 
 	if ((error = ipts_get_device_info(sc)) != 0)
 		return (error);
+	sc->feat_buf = malloc(sc->data_size, M_IPTS, M_WAITOK | M_ZERO);
 	if ((error = ipts_alloc_buffers(sc)) != 0) {
 		device_printf(sc->dev, "cannot allocate DMA buffers: %d\n",
 		    error);
@@ -1008,6 +1194,24 @@ ipts_buffers_sysctl(SYSCTL_HANDLER_ARGS)
 	return (SYSCTL_OUT(req, buf, sizeof(buf)));
 }
 
+/* Input reports by report ID: "id:count" for each ID that came. */
+static int
+ipts_report_ids_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct ipts_softc *sc = arg1;
+	struct sbuf sb;
+	int error, i;
+
+	sbuf_new_for_sysctl(&sb, NULL, 256, req);
+	for (i = 0; i < 256; i++)
+		if (sc->st_ids[i] != 0)
+			sbuf_printf(&sb, "%s%#x:%lu", sbuf_len(&sb) > 0 ?
+			    " " : "", i, sc->st_ids[i]);
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+
 static void
 ipts_add_sysctls(struct ipts_softc *sc)
 {
@@ -1053,6 +1257,11 @@ ipts_add_sysctls(struct ipts_softc *sc)
 	SYSCTL_ADD_OPAQUE(ctx, list, OID_AUTO, "ready_rsp", CTLFLAG_RD,
 	    sc->ready_rsp, sizeof(sc->ready_rsp), "CU",
 	    "Payload of the last READY_FOR_DATA response");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "report_ids",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    ipts_report_ids_sysctl, "A", "Input reports by report ID");
+	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "rsp_unexpected", CTLFLAG_RD,
+	    &sc->st_rsp_unexpected, "Messages that are not responses");
 	SYSCTL_ADD_ULONG(ctx, list, OID_AUTO, "hid_reports", CTLFLAG_RD,
 	    &sc->st_hid_reports, "Reports given to hidbus");
 	SYSCTL_ADD_INT(ctx, list, OID_AUTO, "dump", CTLFLAG_RW,
@@ -1081,11 +1290,15 @@ ipts_attach(device_t dev)
 	sc->mode = ipts_mode == IPTS_MODE_POLL ? IPTS_MODE_POLL :
 	    IPTS_MODE_EVENT;
 	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
+	sx_init(&sc->cmd_lock, "ipts cmd");
+	sx_init(&sc->feat_lock, "ipts feature");
 	ipts_add_sysctls(sc);
 
 	error = mei_cl_connect(dev);
 	if (error != 0) {
 		device_printf(dev, "cannot connect: %d\n", error);
+		sx_destroy(&sc->feat_lock);
+		sx_destroy(&sc->cmd_lock);
 		mtx_destroy(&sc->mtx);
 		return (error);
 	}
@@ -1119,6 +1332,9 @@ ipts_detach(device_t dev)
 		ipts_free_buffers(sc);
 	free(sc->hid_desc, M_IPTS);
 	free(sc->rdesc, M_IPTS);
+	free(sc->feat_buf, M_IPTS);
+	sx_destroy(&sc->feat_lock);
+	sx_destroy(&sc->cmd_lock);
 	mtx_destroy(&sc->mtx);
 	return (0);
 }
